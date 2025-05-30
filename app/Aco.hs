@@ -16,7 +16,16 @@ data Direction = Forward | Backward
 type Source = Vertex
 type Destination = Vertex
 type Path = [Vertex]
-data Ant = Ant Vertex Direction Path Source Destination
+
+data Ant = Ant
+    {
+        position :: Vertex,
+        direction :: Direction,
+        path :: Path,
+        source :: Source,
+        destination :: Destination,
+        randomGen :: StdGen
+    }
     deriving (Eq, Show)
 
 type Pheromone = Float              -- pheromone left by Ants
@@ -29,7 +38,9 @@ type AntEdgeLabel = Label Pheromone -- label for edges, with the total deposited
 type EdgeLabels = M.Map Edge AntEdgeLabel
 
 getEdgeLabel :: Edge -> EdgeLabels -> AntEdgeLabel
-getEdgeLabel e m = m M.! e -- calls error if the edge is not present
+getEdgeLabel e m = case M.lookup e m of -- calls error if the edge is not present
+                    (Just label) -> label
+                    Nothing -> error ("Edge label of" ++ show e ++ " not found.")
 
 setEdgeLabel :: Edge -> AntEdgeLabel -> EdgeLabels -> EdgeLabels
 setEdgeLabel = M.insert
@@ -54,7 +65,7 @@ weightedRandomChoice :: RandomGen g => g -> [(a, Rational)] -> (g,a)
 weightedRandomChoice randGen weights = (g,a)
     where m = fromList weights
         -- this is not needed but otherwise I need to change all the functions using weightedRandomChoice
-          (a,g) = runRand m randGen 
+          (a,g) = runRand m randGen
 
 -- Gives the weighted list of possible next vertices for an Ant, given the
 -- Pheromone on the Edge(s)
@@ -66,7 +77,21 @@ nextVertices es labels = map getWeightedVertex es
                                 in (v, p)
 
 removeLoops :: Path -> Path
-removeLoops = id
+removeLoops p = rL M.empty (zipWith (,) p [1..]) []
+    where
+    rL :: M.Map Vertex Int -> [(Vertex, Int)] -> Path -> Path
+    rL _ [] loopFree = loopFree
+    rL m ((v,pos):xs) loopFree =
+        case M.lookup v m of
+            -- if the element was found before, drop all elements in loopFree after pos'
+            (Just pos') ->
+                let loopFree' = take pos' loopFree
+                    -- need to recompute the indices
+                    m' = foldr (\(x,p) m'' -> M.insert x p m'') M.empty (zipWith (,) loopFree' [1..])
+                in rL m' xs loopFree'
+            -- otherwise, add the current element to the accumulator
+            Nothing -> rL (M.insert v pos m) xs (loopFree ++ [v])
+
 
 nextVertex :: RandomGen g  => g -> [Edge] -> EdgeLabels -> (g, Vertex)
 nextVertex randGen es edgeLabels =
@@ -78,8 +103,8 @@ nextVertex randGen es edgeLabels =
 data PheromoneUpdate = PU Edge Pheromone
 
 
-antStep :: RandomGen g => g -> Graph -> EdgeLabels -> Ant -> Pheromone -> (g, (Ant, PheromoneUpdate))
-antStep randGen g edgeLabels a@(Ant v Forward path s d) pheromone =
+antStep :: Graph -> EdgeLabels -> Ant -> Pheromone -> (Ant, PheromoneUpdate)
+antStep g edgeLabels a@(Ant v Forward path s d randGen) pheromone =
     -- don't consider the last visited Vertex
     let butLastVisited = case path of
                             [] -> outEdges g v
@@ -89,31 +114,29 @@ antStep randGen g edgeLabels a@(Ant v Forward path s d) pheromone =
         possibleEdges = butLastVisited
         (newRandGen, nxt) = nextVertex randGen possibleEdges edgeLabels
         in if nxt == d then
-           (newRandGen, (Ant nxt Backward (removeLoops (path ++ [v])) s d, PU (v,nxt) 0))
+           (Ant nxt Backward (removeLoops (path ++ [v])) s d newRandGen, PU (v,nxt) 0)
           else
-           (newRandGen, (Ant nxt Forward (path ++ [v]) s d, PU (v,nxt) 0))
-antStep randGen _ _ a@(Ant v Backward path s d) pheromone =
+           (Ant nxt Forward (path ++ [v]) s d newRandGen, PU (v,nxt) 0)
+antStep _ _ a@(Ant v Backward path s d randGen) pheromone =
     -- don't consider the last visited Vertex
     let nxt = case path of
                 [] -> error ("No vertices in path of ant " ++ show a)
                 _ -> last path
     in if nxt == s then
-        (randGen, (Ant nxt Forward [] s d, PU (v,nxt) pheromone))
+        (Ant nxt Forward [] s d randGen, PU (v,nxt) pheromone)
        else
-        (randGen, (Ant nxt Backward (init path) s d, PU (v,nxt) pheromone))
+        (Ant nxt Backward (init path) s d randGen, PU (v,nxt) pheromone)
 
-graphStep :: RandomGen g => g -> Graph -> [Ant] -> EdgeLabels -> Pheromone -> (g, ([Ant], EdgeLabels))
-graphStep randGen g [] edgeLabels _ = (randGen, ([], edgeLabels))
-graphStep randGen g (ant:ants) edgeLabels pheromone = (newRandGen, (finalAnts, updatedEdgeLabels))
-    where (tempRandGen, (newAnts, newEdgeLabels)) = graphStep randGen g ants edgeLabels pheromone
-          (newRandGen, (newAnt, update)) = antStep tempRandGen g edgeLabels ant pheromone
+graphStep :: Graph -> [Ant] -> EdgeLabels -> Pheromone -> ([Ant], EdgeLabels)
+graphStep  g [] edgeLabels _ = ([], edgeLabels)
+graphStep  g (ant:ants) edgeLabels pheromone = (finalAnts, updatedEdgeLabels)
+    where (newAnts, newEdgeLabels) = graphStep g ants edgeLabels pheromone
+          (newAnt, update) = antStep g edgeLabels ant pheromone
           finalAnts = newAnt:newAnts
           updatedEdgeLabels = updateEdgeLabel update newEdgeLabels
 
 evaporate :: EdgeLabels -> Volatility -> EdgeLabels
 evaporate edgeLabels v = M.map (\(Label p) -> Label (p - (p * v))) edgeLabels
-
-
 
 updateEdgeLabel :: PheromoneUpdate -> EdgeLabels -> EdgeLabels
 updateEdgeLabel (PU (u,v) pu) els =
@@ -123,18 +146,16 @@ updateEdgeLabel (PU (u,v) pu) els =
         els' = setEdgeLabel (u,v) (Label $ old + pu) els
         in setEdgeLabel (v,u) (Label $ old' + pu) els'
 
-
 initEdgeLabels :: Graph -> Pheromone -> Aco.EdgeLabels
 initEdgeLabels g p = foldr initPheromone M.empty (edges g)
     where
         initPheromone edge labels = Aco.setEdgeLabel edge (Label p) labels
 
-
-simulate :: RandomGen g => g -> Int -> Graph -> [Ant] -> EdgeLabels -> Volatility -> Pheromone -> ([Ant], EdgeLabels)
-simulate _ 0 _ ants edgeLabels _ _ = (ants, edgeLabels)
-simulate randGen steps g ants edgeLabels volatility pheromone =
-    let (newRandGen, (newAnts, newEdgeLabels)) = graphStep randGen g ants (evaporate edgeLabels volatility) pheromone
-    in simulate newRandGen (steps-1) g newAnts newEdgeLabels volatility pheromone
+simulate :: Int -> Graph -> [Ant] -> EdgeLabels -> Volatility -> Pheromone -> ([Ant], EdgeLabels)
+simulate  0 _ ants edgeLabels _ _ = (ants, edgeLabels)
+simulate  steps g ants edgeLabels volatility pheromone =
+    let (newAnts, newEdgeLabels) = graphStep g ants (evaporate edgeLabels volatility) pheromone
+    in simulate (steps-1) g newAnts newEdgeLabels volatility pheromone
 
 showEdges :: Show key => EdgeLabels -> Graph -> (Vertex -> (node, key, [key])) -> [String]
 showEdges edgeLabels g f = map printEdge (edges g)
